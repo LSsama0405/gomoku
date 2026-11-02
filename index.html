@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f4efe4">
+<title>五子棋 · 联机</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  background:radial-gradient(120% 80% at 50% 0%,#fbf7ee 0%,#f1e9d8 60%,#e7dcc6 100%);
+  color:#2f2a22;display:flex;justify-content:center;align-items:flex-start;
+  padding:calc(14px + env(safe-area-inset-top)) 12px calc(14px + env(safe-area-inset-bottom));
+  min-height:100%;-webkit-user-select:none;user-select:none}
+#app{width:100%;max-width:560px}
+h1{font-size:26px;margin:18px 0 4px;letter-spacing:.08em;text-align:center}
+.sub{margin:0 0 26px;text-align:center;color:#8a7f6b;font-size:13px}
+button{font:inherit;border:0;border-radius:14px;padding:14px 18px;background:#fff;
+  color:#3a3327;box-shadow:0 2px 10px rgba(90,70,40,.12);transition:transform .08s}
+button:active{transform:scale(.97)}
+button.primary{width:100%;background:linear-gradient(180deg,#3c3427,#26211a);color:#f7f2e6;font-weight:600;
+  font-size:16px;padding:16px;box-shadow:0 6px 18px rgba(50,40,25,.28)}
+.join{display:flex;gap:10px;margin-top:12px}
+.join input{flex:1;min-width:0;font:inherit;padding:14px 16px;border-radius:14px;border:1px solid #ded3bd;
+  background:#fffdf8;text-transform:uppercase;letter-spacing:.18em}
+.join input::placeholder{letter-spacing:.06em;text-transform:none;color:#b3a894}
+.join button{width:96px;font-weight:600;background:#fffdf8;border:1px solid #ded3bd;box-shadow:none}
+.tip{color:#a1937a;font-size:12.5px;text-align:center;margin-top:16px;line-height:1.6;min-height:1em}
+.bar{display:flex;align-items:center;gap:8px;justify-content:space-between;font-size:12.5px;color:#8a7f6b;
+  padding:0 4px 8px}
+.dot{width:8px;height:8px;border-radius:50%;background:#c9c0ae;display:inline-block;margin-right:6px;
+  transition:background .2s}
+.dot.on{background:#3fa86a;box-shadow:0 0 0 3px rgba(63,168,106,.16)}
+.dot.off{background:#d9cfba}
+.status{text-align:center;font-size:15px;font-weight:600;padding:6px 0 12px;min-height:24px}
+.status.win{color:#2c7a4b}
+.status.lose{color:#a5493f}
+canvas{display:block;margin:0 auto;border-radius:16px;touch-action:manipulation;
+  box-shadow:0 8px 26px rgba(80,60,30,.18),inset 0 0 0 1px rgba(255,255,255,.5)}
+.ops{display:flex;gap:10px;margin-top:14px}
+.ops button{flex:1;font-size:14px;background:#fffdf8;border:1px solid #e2d7c2;box-shadow:none;padding:13px}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(12px);opacity:0;
+  background:rgba(38,33,26,.92);color:#f6f1e5;font-size:13px;padding:10px 18px;border-radius:999px;
+  transition:.22s;pointer-events:none}
+#toast.show{opacity:1;transform:translateX(-50%)}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="start">
+    <h1>五子棋</h1>
+    <p class="sub">建个房间，把链接发给对方，点开就能下</p>
+    <button id="btnCreate" class="primary">创建房间（我先手）</button>
+    <div class="join">
+      <input id="code" placeholder="输入房间号" maxlength="120" autocomplete="off" autocapitalize="characters" spellcheck="false">
+      <button id="btnJoin">加入</button>
+    </div>
+    <p class="tip" id="tip">一个人点「创建房间」，把 4 位房间号发给对方<br>对方输号加入就联上了</p>
+  </div>
+  <div id="game" hidden>
+    <div class="bar"><span id="roomInfo"></span><span id="conn"></span></div>
+    <div id="status" class="status">准备中…</div>
+    <canvas id="board"></canvas>
+    <div class="ops">
+      <button id="btnCopy">复制邀请链接</button>
+      <button id="btnNew">再来一局</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script>/* ---- MQTT 3.1.1 迷你客户端（QoS0）+ 五子棋纯逻辑，纯 JS 无依赖 ---- */
+(function (G) {
+  const enc = new TextEncoder(), dec = new TextDecoder();
+
+  function strB(s) { const b = enc.encode(s); return [b.length >> 8 & 255, b.length & 255].concat(Array.from(b)); }
+  function rlEnc(n) { const o = []; do { let b = n % 128; n = Math.floor(n / 128); if (n > 0) b |= 0x80; o.push(b); } while (n > 0); return o; }
+  function rlDec(buf, off) {
+    let mul = 1, val = 0, i = off;
+    for (; ;) {
+      if (i >= buf.length) return null;
+      const b = buf[i++]; val += (b & 0x7f) * mul;
+      if ((b & 0x80) === 0) break;
+      mul *= 128; if (mul > 128 * 128 * 128) return null;
+    }
+    return { val, end: i };
+  }
+  function pktConnect(cid, ka) {
+    const p = strB('MQTT').concat([4, 0x02, ka >> 8 & 255, ka & 255]).concat(strB(cid));
+    return new Uint8Array([0x10].concat(rlEnc(p.length), p));
+  }
+  function pktSubscribe(topic, id) {
+    const p = [id >> 8 & 255, id & 255].concat(strB(topic), [0]);
+    return new Uint8Array([0x82].concat(rlEnc(p.length), p));
+  }
+  function pktPublish(topic, payload) {
+    const p = strB(topic).concat(Array.from(enc.encode(payload)));
+    return new Uint8Array([0x30].concat(rlEnc(p.length), p));
+  }
+  const PING = new Uint8Array([0xC0, 0]);
+
+  class MqttLite {
+    constructor(o) {
+      this.url = o.url; this.topic = o.topic; this.cid = o.clientId;
+      this.onMessage = o.onMessage || function () { };
+      this.onStatus = o.onStatus || function () { };
+      this.ka = o.keepalive || 45;
+      this.buf = new Uint8Array(0);
+      this.closed = false; this.tries = 0; this.ws = null;
+      this.pid = 1;
+    }
+    connect() {
+      let ws;
+      try { ws = new WebSocket(this.url, 'mqtt'); } catch (e) { this.onStatus('error', String(e && e.message || e)); return this._retry(); }
+      this.ws = ws; ws.binaryType = 'arraybuffer';
+      this.onStatus('connecting');
+      ws.onopen = () => { ws.send(pktConnect(this.cid, this.ka)); };
+      ws.onmessage = (ev) => { this._push(new Uint8Array(ev.data)); };
+      ws.onerror = () => { this.onStatus('error'); };
+      ws.onclose = () => { this.onStatus('closed'); this._retry(); };
+      return this;
+    }
+    _retry() {
+      if (this.closed) return;
+      const wait = Math.min(8000, 800 * Math.pow(2, this.tries++));
+      this.onStatus('reconnect', wait);
+      setTimeout(() => this.connect(), wait);
+    }
+    _push(u8) {
+      const m = new Uint8Array(this.buf.length + u8.length);
+      m.set(this.buf); m.set(u8, this.buf.length); this.buf = m;
+      for (; ;) {
+        if (this.buf.length < 2) return;
+        const r = rlDec(this.buf, 1); if (!r) return;
+        const total = r.end + r.val;
+        if (this.buf.length < total) return;
+        const type = this.buf[0] >> 4, flags = this.buf[0] & 0x0f;
+        const body = this.buf.subarray(r.end, total);
+        this.buf = this.buf.subarray(total);
+        if (type === 2) {
+          this.tries = 0;
+          const rc = body.length > 1 ? body[1] : 0;
+          if (rc === 0) {
+            this.ws.send(pktSubscribe(this.topic, this.pid++));
+            this.onStatus('open');
+            clearInterval(this.pingT);
+            this.pingT = setInterval(() => { try { this.ws.send(PING); } catch (e) { } }, this.ka * 500);
+          } else { this.onStatus('refused', rc); this.closed = true; try { this.ws.close(); } catch (e) { } }
+        } else if (type === 3) {
+          const qos = (flags >> 1) & 3;
+          const tl = (body[0] << 8) | body[1];
+          const topic = dec.decode(body.subarray(2, 2 + tl));
+          const p = 2 + tl + (qos > 0 ? 2 : 0);
+          const payload = dec.decode(body.subarray(p));
+          try { this.onMessage(payload, topic); } catch (e) { }
+        } else if (type === 9) {
+          this.onStatus('subscribed');
+        }
+      }
+    }
+    publish(str) {
+      if (!this.ws || this.ws.readyState !== 1) return false;
+      try { this.ws.send(pktPublish(this.topic, str)); return true; } catch (e) { return false; }
+    }
+    close() { this.closed = true; clearInterval(this.pingT); try { this.ws && this.ws.send(new Uint8Array([0xE0, 0])); this.ws && this.ws.close(); } catch (e) { } }
+  }
+
+  /* ---------------- 五子棋 ---------------- */
+  const N = 15;
+  class Gomoku {
+    constructor() { this.n = N; this.board = '0'.repeat(N * N); this.ply = 0; this.turn = 1; this.win = 0; this.last = -1; this.line = []; this.seq = 1; }
+    newGame() { this.board = '0'.repeat(this.n * this.n); this.ply = 0; this.turn = 1; this.win = 0; this.last = -1; this.line = []; this.seq++; }
+    place(i) {
+      if (this.win || i < 0 || i >= this.board.length || this.board[i] !== '0') return false;
+      const c = this.turn === 1 ? '1' : '2';
+      this.board = this.board.slice(0, i) + c + this.board.slice(i + 1);
+      this.ply++; this.last = i; this.seq++;
+      const line = this.findWin(i, +c);
+      if (line.length) { this.win = +c; this.line = line; }
+      else { this.turn = 3 - this.turn; if (this.ply >= this.board.length) this.win = 3; }
+      return true;
+    }
+    findWin(i, c) {
+      const n = this.n, r0 = Math.floor(i / n), c0 = i % n;
+      const dirs = [[1, 0], [0, 1], [1, 1], [1, -1]];
+      for (const [dx, dy] of dirs) {
+        const cells = [i];
+        for (const s of [1, -1]) {
+          let r = r0 + dy * s, cc = c0 + dx * s;
+          while (r >= 0 && r < n && cc >= 0 && cc < n && this.board[r * n + cc] === String(c)) {
+            if (s === 1) cells.push(r * n + cc); else cells.unshift(r * n + cc);
+            r += dy * s; cc += dx * s;
+          }
+        }
+        if (cells.length >= 5) return cells.slice(0, 5);
+      }
+      return [];
+    }
+    state() { return { v: 1, k: 'state', board: this.board, ply: this.ply, turn: this.turn, win: this.win, last: this.last, line: this.line, seq: this.seq }; }
+    load(s) {
+      if (!s || s.v !== 1 || typeof s.board !== 'string' || s.board.length !== this.n * this.n) return false;
+      if (typeof s.seq !== 'number' || s.seq <= this.seq) return false;
+      this.board = s.board; this.ply = s.ply | 0; this.turn = s.turn === 2 ? 2 : 1;
+      this.win = s.win | 0; this.last = typeof s.last === 'number' ? s.last : -1;
+      this.line = Array.isArray(s.line) ? s.line : []; this.seq = s.seq;
+      return true;
+    }
+  }
+
+  G.MqttLite = MqttLite; G.Gomoku = Gomoku;
+  if (typeof module !== 'undefined' && module.exports) module.exports = { MqttLite, Gomoku };
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+</script>
+<script>
+(function(){
+const $=function(id){return document.getElementById(id)};
+const N=15, ALPHA='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
+const game=new Gomoku();
+var me=null, code='', mqtt=null, connected=false, oppAt=0, brokerIdx=0, closedCount=0, hb=null;
+var cid=Math.random().toString(16).slice(2,10);
+var pending=-1, pendingT=null;   /* 待确认的落点：第一次点只是预览 */
+
+/* ---------- 画面 ---------- */
+var cv=$('board'), ctx=cv.getContext('2d'), geo={w:0,pad:0,cell:0};
+function layout(){
+  var w=Math.min(document.documentElement.clientWidth-24,560);
+  var dpr=Math.min(3,window.devicePixelRatio||1);
+  cv.style.width=w+'px'; cv.style.height=w+'px';
+  cv.width=Math.round(w*dpr); cv.height=Math.round(w*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  geo.w=w; geo.pad=w*0.062; geo.cell=(w-2*geo.pad)/(N-1);
+  draw();
+}
+function xy(i){var r=Math.floor(i/N),c=i%N;return [geo.pad+c*geo.cell,geo.pad+r*geo.cell]}
+function draw(){
+  var w=geo.w,p=geo.pad,c=geo.cell,i,r,col,row;
+  var g=ctx.createLinearGradient(0,0,w,w);
+  g.addColorStop(0,'#f0d9a8'); g.addColorStop(.5,'#e9cd94'); g.addColorStop(1,'#dfbe80');
+  ctx.fillStyle=g; ctx.fillRect(0,0,w,w);
+  ctx.strokeStyle='rgba(90,66,32,.55)'; ctx.lineWidth=1;
+  ctx.beginPath();
+  for(i=0;i<N;i++){
+    ctx.moveTo(p+i*c,p); ctx.lineTo(p+i*c,p+(N-1)*c);
+    ctx.moveTo(p,p+i*c); ctx.lineTo(p+(N-1)*c,p+i*c);
+  }
+  ctx.stroke();
+  ctx.strokeStyle='rgba(90,66,32,.85)'; ctx.lineWidth=2;
+  ctx.strokeRect(p,p,(N-1)*c,(N-1)*c);
+  ctx.fillStyle='rgba(80,58,28,.85)';
+  [[3,3],[11,3],[3,11],[11,11],[7,7]].forEach(function(s){
+    ctx.beginPath(); ctx.arc(p+s[0]*c,p+s[1]*c,Math.max(2,c*0.075),0,7); ctx.fill();
+  });
+  ctx.font=Math.round(c*0.42)+'px -apple-system,sans-serif';
+  ctx.fillStyle='rgba(90,66,32,.5)'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  for(i=0;i<N;i++) ctx.fillText(ALPHA[i],p+i*c,p-c*0.55);
+  for(i=0;i<N;i++) ctx.fillText(String(i+1),p-c*0.62,p+i*c);
+  var b=game.board;
+  for(i=0;i<b.length;i++){
+    if(b[i]==='0') continue;
+    r=Math.floor(i/N); col=i%N;
+    var x=p+col*c, y=p+r*c, rad=c*0.44;
+    ctx.beginPath(); ctx.arc(x+c*0.03,y+c*0.05,rad,0,7);
+    ctx.fillStyle='rgba(60,45,20,.28)'; ctx.fill();
+    var rg=ctx.createRadialGradient(x-rad*0.35,y-rad*0.4,rad*0.15,x,y,rad);
+    if(b[i]==='1'){ rg.addColorStop(0,'#6b6b6b'); rg.addColorStop(.45,'#2b2b2b'); rg.addColorStop(1,'#0d0d0d'); }
+    else { rg.addColorStop(0,'#ffffff'); rg.addColorStop(.55,'#f2efe8'); rg.addColorStop(1,'#cfc8ba'); }
+    ctx.beginPath(); ctx.arc(x,y,rad,0,7); ctx.fillStyle=rg; ctx.fill();
+    ctx.strokeStyle=b[i]==='1'?'rgba(0,0,0,.5)':'rgba(120,110,95,.5)'; ctx.lineWidth=1; ctx.stroke();
+  }
+  if(pending>=0){
+    var pq=xy(pending);
+    ctx.beginPath(); ctx.arc(pq[0],pq[1],c*0.44,0,7);
+    ctx.fillStyle=game.turn===1?'rgba(20,20,20,.42)':'rgba(255,255,255,.62)';
+    ctx.fill();
+    ctx.strokeStyle='rgba(214,60,52,.9)'; ctx.lineWidth=Math.max(2,c*0.06); ctx.stroke();
+  }
+  if(game.line&&game.line.length){
+    ctx.strokeStyle='rgba(214,60,52,.9)'; ctx.lineWidth=Math.max(2,c*0.09);
+    var a=xy(game.line[0]), z=xy(game.line[game.line.length-1]);
+    ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(z[0],z[1]); ctx.stroke();
+  } else if(game.last>=0){
+    var q=xy(game.last);
+    ctx.beginPath(); ctx.arc(q[0],q[1],c*0.13,0,7);
+    ctx.fillStyle=game.board[game.last]==='1'?'rgba(255,120,90,.95)':'rgba(200,60,50,.9)'; ctx.fill();
+  }
+}
+function toast(t){var el=$('toast');el.textContent=t;el.classList.add('show');
+  clearTimeout(toast.t);toast.t=setTimeout(function(){el.classList.remove('show')},1600)}
+function mine(){return me==='b'?1:2}
+function alive(){return oppAt && Date.now()-oppAt<25000}
+function render(){
+  $('roomInfo').textContent='房间 '+code;
+  var dot=$('conn'), st=$('status');
+  dot.innerHTML='<span class="dot '+(connected?(alive()?'on':'off'):'')+'"></span>'+
+    (connected?(alive()?'对方在线':'等对方进来'):'连接中');
+  st.className='status';
+  if(!connected){ st.textContent='正在连接服务器…'; return; }
+  if(game.win===3){ st.textContent='平局，点「再来一局」'; return; }
+  if(game.win){ st.textContent=game.win===mine()?'你赢了 🎉':'你输了'; st.className='status '+(game.win===mine()?'win':'lose'); return; }
+  if(!alive()){ st.textContent='等对方进房间（房间号 '+code+'）'; return; }
+  st.textContent=game.turn===mine()?'轮到你了':(me==='b'?'等黑棋…':'等白棋…');
+  if(game.turn===mine()) st.textContent='轮到你了'+(me==='b'?'（黑）':'（白）');
+  else st.textContent='等对方落子…';
+}
+setInterval(render,2500);
+
+/* ---------- 联机 ---------- */
+function randomCode(){var s='';for(var i=0;i<4;i++)s+=ALPHA[Math.floor(Math.random()*ALPHA.length)];return s}
+function connect(){
+  if(mqtt) { try{mqtt.close()}catch(e){} }
+  mqtt=new MqttLite({
+    url:BROKERS[brokerIdx%BROKERS.length],
+    topic:'gmk-dfy/'+code,
+    clientId:'gmk_'+code+'_'+cid,
+    onMessage:onMsg,
+    onStatus:onStatus
+  });
+  mqtt.connect();
+  render();
+}
+function onStatus(s,arg){
+  if(s==='open'){
+    connected=true; closedCount=0;
+    mqtt.publish(JSON.stringify({k:'hi',from:me,id:cid,seq:game.seq}));
+    if(me==='w') mqtt.publish(JSON.stringify({k:'req'}));
+    render();
+    if(!hb) hb=setInterval(function(){
+      if(mqtt&&connected){ mqtt.publish(JSON.stringify({k:'hi',from:me,id:cid})); if(me==='w'&&game.ply===0) mqtt.publish(JSON.stringify({k:'req'})); }
+    },6000);
+  }else if(s==='connecting'){ connected=false; render(); }
+  else if(s==='closed'||s==='error'||s==='refused'){
+    connected=false; render();
+    if(s==='closed'){ closedCount++; if(closedCount>=3){ closedCount=0; brokerIdx++; } }
+  }
+}
+function resolveClash(otherId){
+  /* 同一间屋同一边只能站一个人：id 小的当黑（先手），大的让位 */
+  if(!connected || game.ply!==0) return;
+  if(me==='b' && cid>otherId){ me='w'; toast('已经有黑方了，你换成白棋'); }
+  else if(me==='w' && cid<otherId){ me='b'; toast('你当黑棋，先手'); }
+  else return;
+  mqtt.publish(JSON.stringify({k:'hi',from:me,id:cid,seq:game.seq}));
+  if(me==='w') mqtt.publish(JSON.stringify({k:'req'}));
+  render();
+}
+var lastPush=0;
+function pushThrottled(){ if(Date.now()-lastPush>2000){ lastPush=Date.now(); push(); } }
+function onMsg(payload){
+  var m; try{m=JSON.parse(payload)}catch(e){return}
+  if(!m||typeof m!=='object') return;
+  if(m.id && m.id===cid) return;          /* 自己的回声 */
+  if(m.from===me && !m.id) return;        /* 旧消息没有 id，同边一律当回声 */
+  if(m.k==='hi'){
+    oppAt=Date.now();
+    if(m.id && m.id!==cid && m.from===me) resolveClash(m.id);
+    if(me==='b') pushThrottled();
+    render(); return;
+  }
+  if(m.k==='req'){ oppAt=Date.now(); if(me==='b') pushThrottled(); return; }
+  if(m.k==='state'){
+    oppAt=Date.now();
+    if(game.load(m)){ pending=-1; clearTimeout(pendingT); draw(); }
+    render();
+  }
+}
+function push(){ if(mqtt) mqtt.publish(JSON.stringify(game.state())); render(); }
+
+/* ---------- 交互 ---------- */
+cv.addEventListener('pointerdown',function(e){
+  e.preventDefault();
+  if(!connected||game.win||game.turn!==mine()) return;
+  var rect=cv.getBoundingClientRect();
+  var x=e.clientX-rect.left, y=e.clientY-rect.top;
+  var col=Math.round((x-geo.pad)/geo.cell), row=Math.round((y-geo.pad)/geo.cell);
+  if(row<0||row>=N||col<0||col>=N) return;
+  var px=geo.pad+col*geo.cell, py=geo.pad+row*geo.cell;
+  if(Math.sqrt((px-x)*(px-x)+(py-y)*(py-y))>geo.cell*0.8) return;
+  var idx=row*N+col;
+  if(pending===idx && game.place(idx)){
+    pending=-1; clearTimeout(pendingT); draw(); push();
+    if(navigator.vibrate) navigator.vibrate(10);
+  }else{
+    pending=idx; draw();
+    toast('再点一下同一格才落子');
+    clearTimeout(pendingT);
+    pendingT=setTimeout(function(){ pending=-1; draw(); },4000);
+  }
+},{passive:false});
+
+function startGame(role,roomCode){
+  me=role; code=roomCode;
+  $('start').hidden=true; $('game').hidden=false;
+  try{ history.replaceState(null,'','?room='+code+(role==='b'?'&b=1':'')) }catch(e){}
+  layout(); connect();
+}
+$('btnCreate').onclick=function(){ startGame('b',randomCode()); };
+$('btnJoin').onclick=function(){
+  var raw=$('code').value||'';
+  var mm=raw.match(/room=([A-Za-z2-9]{4})/);
+  if(mm) raw=mm[1];
+  var v=raw.toUpperCase().replace(/[^A-Z2-9]/g,'').slice(0,4);
+  if(v.length<4){ toast('房间号是 4 位'); return; }
+  startGame('w',v);
+};
+$('code').addEventListener('keydown',function(e){ if(e.key==='Enter') $('btnJoin').click(); });
+$('btnCopy').onclick=function(){
+  var url=location.origin+location.pathname+'?room='+code;
+  var done=function(){ toast('链接复制好了，发群里吧') };
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(url).then(done,function(){prompt('复制这条链接',url)}); }
+  else prompt('复制这条链接',url);
+};
+$('btnNew').onclick=function(){ game.newGame(); pending=-1; clearTimeout(pendingT); draw(); push(); toast('新一局'); };
+window.addEventListener('resize',layout);
+window.addEventListener('orientationchange',function(){setTimeout(layout,200)});
+
+window.__gmk={game:game,me:function(){return me},code:function(){return code},online:function(){return connected&&alive()}};
+var q=null; try{ q=new URLSearchParams(location.search).get('room') }catch(e){}
+if(q&&q.length>=4){ startGame(/[?&]b=1/.test(location.search)?'b':'w',q.toUpperCase().replace(/[^A-Z2-9]/g,'').slice(0,4)); }
+else { layout(); }
+})();
+</script>
+</body>
+</html>
